@@ -1,27 +1,11 @@
 ﻿/*
- * MIT License
- *
- * Copyright (c) 2016-2019 xiongziliang <771730766@qq.com>
+ * Copyright (c) 2016 The ZLMediaKit project authors. All Rights Reserved.
  *
  * This file is part of ZLMediaKit(https://github.com/xiongziliang/ZLMediaKit).
  *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in all
- * copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * Use of this source code is governed by MIT license that can be found in the
+ * LICENSE file in the root of the source tree. All contributing project authors
+ * may be found in the AUTHORS file in the root of the source tree.
  */
 
 #include "H265Rtp.h"
@@ -70,15 +54,13 @@ H265RtpDecoder::H265RtpDecoder() {
 H265Frame::Ptr  H265RtpDecoder::obtainFrame() {
     //从缓存池重新申请对象，防止覆盖已经写入环形缓存的对象
     auto frame = ResourcePoolHelper<H265Frame>::obtainObj();
-    frame->buffer.clear();
-    frame->iPrefixSize = 4;
+    frame->_buffer.clear();
+    frame->_prefix_size = 4;
     return frame;
 }
 
 bool H265RtpDecoder::inputRtp(const RtpPacket::Ptr &rtp, bool key_pos) {
-    key_pos = decodeRtp(rtp);
-    RtpCodec::inputRtp(rtp, key_pos);
-    return key_pos;
+    return decodeRtp(rtp);
 }
 
 bool H265RtpDecoder::decodeRtp(const RtpPacket::Ptr &rtppack) {
@@ -101,11 +83,11 @@ bool H265RtpDecoder::decodeRtp(const RtpPacket::Ptr &rtppack) {
             MakeFU(frame[2], fu);
             if (fu.S) {
                 //该帧的第一个rtp包
-                _h265frame->buffer.assign("\x0\x0\x0\x1", 4);
-                _h265frame->buffer.push_back(fu.type << 1);
-                _h265frame->buffer.push_back(0x01);
-                _h265frame->buffer.append((char *) frame + 3, length - 3);
-                _h265frame->timeStamp = rtppack->timeStamp;
+                _h265frame->_buffer.assign("\x0\x0\x0\x1", 4);
+                _h265frame->_buffer.push_back(fu.type << 1);
+                _h265frame->_buffer.push_back(0x01);
+                _h265frame->_buffer.append((char *) frame + 3, length - 3);
+                _h265frame->_pts = rtppack->timeStamp;
                 //该函数return时，保存下当前sequence,以便下次对比seq是否连续
                 _lastSeq = rtppack->sequence;
                 return (_h265frame->keyFrame()); //i frame
@@ -113,32 +95,31 @@ bool H265RtpDecoder::decodeRtp(const RtpPacket::Ptr &rtppack) {
 
             if (rtppack->sequence != _lastSeq + 1 && rtppack->sequence != 0) {
                 //中间的或末尾的rtp包，其seq必须连续(如果回环了则判定为连续)，否则说明rtp丢包，那么该帧不完整，必须得丢弃
-                _h265frame->buffer.clear();
+                _h265frame->_buffer.clear();
                 WarnL << "rtp sequence不连续: " << rtppack->sequence << " != " << _lastSeq << " + 1,该帧被废弃";
                 return false;
             }
 
             if (!fu.E) {
                 //该帧的中间rtp包
-                _h265frame->buffer.append((char *) frame + 3, length - 3);
+                _h265frame->_buffer.append((char *) frame + 3, length - 3);
                 //该函数return时，保存下当前sequence,以便下次对比seq是否连续
                 _lastSeq = rtppack->sequence;
                 return false;
             }
 
             //该帧最后一个rtp包
-            _h265frame->buffer.append((char *) frame + 3, length - 3);
-            _h265frame->timeStamp = rtppack->timeStamp;
-            auto key = _h265frame->keyFrame();
+            _h265frame->_buffer.append((char *) frame + 3, length - 3);
+            _h265frame->_pts = rtppack->timeStamp;
             onGetH265(_h265frame);
-            return key;
+            return false;
         }
 
         default: // 4.4.1. Single NAL Unit Packets (p24)
             //a full frame
-            _h265frame->buffer.assign("\x0\x0\x0\x1", 4);
-            _h265frame->buffer.append((char *)frame, length);
-            _h265frame->timeStamp = rtppack->timeStamp;
+            _h265frame->_buffer.assign("\x0\x0\x0\x1", 4);
+            _h265frame->_buffer.append((char *)frame, length);
+            _h265frame->_pts = rtppack->timeStamp;
             auto key = _h265frame->keyFrame();
             onGetH265(_h265frame);
             return key;
@@ -146,8 +127,18 @@ bool H265RtpDecoder::decodeRtp(const RtpPacket::Ptr &rtppack) {
 }
 
 void H265RtpDecoder::onGetH265(const H265Frame::Ptr &frame) {
-    //写入环形缓存
-    RtpCodec::inputFrame(frame);
+    //计算dts
+    auto flag = _dts_generator.getDts(frame->_pts,frame->_dts);
+    if(!flag){
+        if(frame->configFrame() || frame->keyFrame()){
+            flag = true;
+            frame->_dts = frame->_pts;
+        }
+    }
+    if(flag){
+        //写入环形缓存
+        RtpCodec::inputFrame(frame);
+    }
     _h265frame = obtainFrame();
 }
 
@@ -167,19 +158,18 @@ H265RtpEncoder::H265RtpEncoder(uint32_t ui32Ssrc,
 }
 
 void H265RtpEncoder::inputFrame(const Frame::Ptr &frame) {
-    RtpCodec::inputFrame(frame);
-
     GET_CONFIG(uint32_t,cycleMS,Rtp::kCycleMS);
     uint8_t *pcData = (uint8_t*)frame->data() + frame->prefixSize();
-    auto uiStamp = frame->stamp();
+    auto uiStamp = frame->pts();
     auto iLen = frame->size() - frame->prefixSize();
     unsigned char naluType = H265_TYPE(pcData[0]); //获取NALU的5bit 帧类型
     uiStamp %= cycleMS;
 
     int maxSize = _ui32MtuSize - 3;
-    if (iLen > maxSize) { //超过MTU
+    //超过MTU,按照FU方式打包
+    if (iLen > maxSize) {
         //获取帧头数据，1byte
-        unsigned char s_e_type;
+        unsigned char s_e_flags;
         bool bFirst = true;
         bool mark = false;
         int nOffset = 2;
@@ -187,20 +177,34 @@ void H265RtpEncoder::inputFrame(const Frame::Ptr &frame) {
             if (iLen < nOffset + maxSize) {			//是否拆分结束
                 maxSize = iLen - nOffset;
                 mark = true;
-                s_e_type = 1 << 6 | naluType;
+                //FU end
+                s_e_flags = (1 << 6) | naluType;
             } else if (bFirst) {
-                    s_e_type = 1 << 7 | naluType;
+                //FU start
+                s_e_flags = (1 << 7) | naluType;
             } else {
-                s_e_type = naluType;
+                //FU mid
+                s_e_flags = naluType;
             }
 
-            //FU type
-            _aucSectionBuf[0] = 49 << 1;
-            _aucSectionBuf[1] = 1;
-            _aucSectionBuf[2] = s_e_type;
-            memcpy(_aucSectionBuf + 3, pcData + nOffset, maxSize);
+            {
+                //传入nullptr先不做payload的内存拷贝
+                auto rtp = makeRtp(getTrackType(), nullptr, maxSize + 3, mark, uiStamp);
+                //rtp payload 负载部分
+                uint8_t *payload = (uint8_t*)rtp->data() + rtp->offset;
+                //FU 第1个字节，表明为FU
+                payload[0] = 49 << 1;
+                //FU 第2个字节貌似固定为1
+                payload[1] = 1;
+                //FU 第3个字节
+                payload[2] = s_e_flags;
+                //H265 数据
+                memcpy(payload + 3,pcData + nOffset, maxSize);
+                //输入到rtp环形缓存
+                RtpCodec::inputRtp(rtp,bFirst && H265Frame::isKeyFrame(naluType));
+            }
+
             nOffset += maxSize;
-            makeH265Rtp(naluType,_aucSectionBuf, maxSize + 3, mark,bFirst, uiStamp);
             bFirst = false;
         }
     } else {

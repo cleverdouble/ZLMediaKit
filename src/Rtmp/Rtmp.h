@@ -1,28 +1,13 @@
 ﻿/*
- * MIT License
- *
- * Copyright (c) 2016-2019 xiongziliang <771730766@qq.com>
+ * Copyright (c) 2016 The ZLMediaKit project authors. All Rights Reserved.
  *
  * This file is part of ZLMediaKit(https://github.com/xiongziliang/ZLMediaKit).
  *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in all
- * copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * Use of this source code is governed by MIT license that can be found in the
+ * LICENSE file in the root of the source tree. All contributing project authors
+ * may be found in the AUTHORS file in the root of the source tree.
  */
+
 #ifndef __rtmp_h
 #define __rtmp_h
 
@@ -86,6 +71,10 @@ using namespace toolkit;
 
 #define FLV_KEY_FRAME				1
 #define FLV_INTER_FRAME				2
+
+#define FLV_CODEC_AAC 10
+#define FLV_CODEC_H264 7
+#define FLV_CODEC_H265 12
 
 namespace mediakit {
 
@@ -153,9 +142,9 @@ public:
     };
 public:
     RtmpPacket() = default;
-    RtmpPacket(const RtmpPacket &that) = default;
-    RtmpPacket &operator=(const RtmpPacket &that) = default;
-    RtmpPacket &operator=(RtmpPacket &&that) = default;
+    RtmpPacket(const RtmpPacket &that) = delete;
+    RtmpPacket &operator=(const RtmpPacket &that) = delete;
+    RtmpPacket &operator=(RtmpPacket &&that) = delete;
 
     RtmpPacket(RtmpPacket &&that){
         typeId = that.typeId;
@@ -215,119 +204,41 @@ public:
         const static int channel[] = { 1, 2 };
         return channel[flvStereoOrMono];
     }
-
-    /**
-     * 返回不带0x00 00 00 01头的sps
-     * @return
-     */
-    string getH264SPS() const {
-        string ret;
-        if (getMediaType() != 7) {
-            return ret;
-        }
-        if (!isCfgFrame()) {
-            return ret;
-        }
-        if (strBuf.size() < 13) {
-            WarnL << "bad H264 cfg!";
-            return ret;
-        }
-        uint16_t sps_size ;
-        memcpy(&sps_size,strBuf.data() + 11,2);
-        sps_size = ntohs(sps_size);
-        if ((int) strBuf.size() < 13 + sps_size) {
-            WarnL << "bad H264 cfg!";
-            return ret;
-        }
-        ret.assign(strBuf.data() + 13, sps_size);
-        return ret;
-    }
-
-    /**
-     * 返回不带0x00 00 00 01头的pps
-     * @return
-     */
-    string getH264PPS() const {
-        string ret;
-        if (getMediaType() != 7) {
-            return ret;
-        }
-        if (!isCfgFrame()) {
-            return ret;
-        }
-        if (strBuf.size() < 13) {
-            WarnL << "bad H264 cfg!";
-            return ret;
-        }
-        uint16_t sps_size ;
-        memcpy(&sps_size,strBuf.data() + 11,2);
-        sps_size = ntohs(sps_size);
-        
-        if ((int) strBuf.size() < 13 + sps_size + 1 + 2) {
-            WarnL << "bad H264 cfg!";
-            return ret;
-        }
-        uint16_t pps_size ;
-        memcpy(&pps_size,strBuf.data() + 13 + sps_size + 1,2);
-        pps_size = ntohs(pps_size);
-        
-        if ((int) strBuf.size() < 13 + sps_size + 1 + 2 + pps_size) {
-            WarnL << "bad H264 cfg!";
-            return ret;
-        }
-        ret.assign(strBuf.data() + 13 + sps_size + 1 + 2, pps_size);
-        return ret;
-    }
-    string getAacCfg() const {
-        string ret;
-        if (getMediaType() != 10) {
-            return ret;
-        }
-        if (!isCfgFrame()) {
-            return ret;
-        }
-        if (strBuf.size() < 4) {
-            WarnL << "bad aac cfg!";
-            return ret;
-        }
-        ret = strBuf.substr(2, 2);
-        return ret;
-    }
 };
 
 
 
 /**
- * rtmp metedata基类，用于描述rtmp格式信息
+ * rtmp metadata基类，用于描述rtmp格式信息
  */
-class Metedata : public CodecInfo{
+class Metadata : public CodecInfo{
 public:
-    typedef std::shared_ptr<Metedata> Ptr;
+    typedef std::shared_ptr<Metadata> Ptr;
 
-    Metedata():_metedata(AMF_OBJECT){}
-    virtual ~Metedata(){}
-    const AMFValue &getMetedata() const{
-        return _metedata;
+    Metadata():_metadata(AMF_OBJECT){}
+    virtual ~Metadata(){}
+    const AMFValue &getMetadata() const{
+        return _metadata;
     }
 protected:
-    AMFValue _metedata;
+    AMFValue _metadata;
 };
 
 /**
-* metedata中除音视频外的其他描述部分
+* metadata中除音视频外的其他描述部分
 */
-class TitleMete : public Metedata{
+class TitleMeta : public Metadata{
 public:
-    typedef std::shared_ptr<TitleMete> Ptr;
+    typedef std::shared_ptr<TitleMeta> Ptr;
 
-    TitleMete(float dur_sec = 0,
+    TitleMeta(float dur_sec = 0,
               uint64_t fileSize = 0,
               const map<string,string> &header = map<string,string>()){
-        _metedata.set("duration", dur_sec);
-        _metedata.set("fileSize", 0);
-        _metedata.set("server","ZLMediaKit");
+        _metadata.set("duration", dur_sec);
+        _metadata.set("fileSize", 0);
+        _metadata.set("server",SERVER_NAME);
         for (auto &pr : header){
-            _metedata.set(pr.first, pr.second);
+            _metadata.set(pr.first, pr.second);
         }
     }
 
@@ -348,12 +259,12 @@ public:
     }
 };
 
-class VideoMete : public Metedata{
+class VideoMeta : public Metadata{
 public:
-    typedef std::shared_ptr<VideoMete> Ptr;
+    typedef std::shared_ptr<VideoMeta> Ptr;
 
-    VideoMete(const VideoTrack::Ptr &video,int datarate = 5000);
-    virtual ~VideoMete(){}
+    VideoMeta(const VideoTrack::Ptr &video,int datarate = 5000);
+    virtual ~VideoMeta(){}
 
     /**
      * 返回音频或视频类型
@@ -375,13 +286,13 @@ private:
 };
 
 
-class AudioMete : public Metedata{
+class AudioMeta : public Metadata{
 public:
-    typedef std::shared_ptr<AudioMete> Ptr;
+    typedef std::shared_ptr<AudioMeta> Ptr;
 
-    AudioMete(const AudioTrack::Ptr &audio,int datarate = 160);
+    AudioMeta(const AudioTrack::Ptr &audio,int datarate = 160);
 
-    virtual ~AudioMete(){}
+    virtual ~AudioMeta(){}
 
     /**
      * 返回音频或视频类型

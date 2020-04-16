@@ -1,27 +1,11 @@
 ﻿/*
- * MIT License
- *
- * Copyright (c) 2016-2019 xiongziliang <771730766@qq.com>
+ * Copyright (c) 2016 The ZLMediaKit project authors. All Rights Reserved.
  *
  * This file is part of ZLMediaKit(https://github.com/xiongziliang/ZLMediaKit).
  *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in all
- * copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * Use of this source code is governed by MIT license that can be found in the
+ * LICENSE file in the root of the source tree. All contributing project authors
+ * may be found in the AUTHORS file in the root of the source tree.
  */
 
 #ifndef ZLMEDIAKIT_FLVMUXER_H
@@ -30,7 +14,7 @@
 #include "Rtmp/Rtmp.h"
 #include "Rtmp/RtmpMediaSource.h"
 #include "Network/Socket.h"
-#include "MediaFile/Stamp.h"
+#include "Common/Stamp.h"
 using namespace toolkit;
 
 namespace mediakit {
@@ -43,14 +27,14 @@ public:
     void stop();
 protected:
     void start(const EventPoller::Ptr &poller,const RtmpMediaSource::Ptr &media);
-    virtual void onWrite(const Buffer::Ptr &data) = 0;
+    virtual void onWrite(const Buffer::Ptr &data, bool flush) = 0;
     virtual void onDetach() = 0;
     virtual std::shared_ptr<FlvMuxer> getSharedPtr() = 0;
 private:
     void onWriteFlvHeader(const RtmpMediaSource::Ptr &media);
-    void onWriteRtmp(const RtmpPacket::Ptr &pkt);
-    void onWriteFlvTag(const RtmpPacket::Ptr &pkt, uint32_t ui32TimeStamp);
-    void onWriteFlvTag(uint8_t ui8Type, const Buffer::Ptr &buffer, uint32_t ui32TimeStamp);
+    void onWriteRtmp(const RtmpPacket::Ptr &pkt,bool flush);
+    void onWriteFlvTag(const RtmpPacket::Ptr &pkt, uint32_t ui32TimeStamp, bool flush);
+    void onWriteFlvTag(uint8_t ui8Type, const Buffer::Ptr &buffer, uint32_t ui32TimeStamp, bool flush);
 private:
     RtmpMediaSource::RingType::RingReader::Ptr _ring_reader;
     //时间戳修整器
@@ -66,7 +50,7 @@ public:
     void startRecord(const EventPoller::Ptr &poller,const string &vhost,const string &app,const string &stream,const string &file_path);
     void startRecord(const EventPoller::Ptr &poller,const RtmpMediaSource::Ptr &media,const string &file_path);
 private:
-    virtual void onWrite(const Buffer::Ptr &data) override ;
+    virtual void onWrite(const Buffer::Ptr &data, bool flush) override ;
     virtual void onDetach() override;
     virtual std::shared_ptr<FlvMuxer> getSharedPtr() override;
 private:

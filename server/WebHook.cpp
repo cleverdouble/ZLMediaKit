@@ -1,27 +1,11 @@
 ﻿/*
- * MIT License
- *
- * Copyright (c) 2016-2019 xiongziliang <771730766@qq.com>
+ * Copyright (c) 2016 The ZLMediaKit project authors. All Rights Reserved.
  *
  * This file is part of ZLMediaKit(https://github.com/xiongziliang/ZLMediaKit).
  *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in all
- * copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * Use of this source code is governed by MIT license that can be found in the
+ * LICENSE file in the root of the source tree. All contributing project authors
+ * may be found in the AUTHORS file in the root of the source tree.
  */
 
 #include <sstream>
@@ -39,6 +23,7 @@
 #include "Rtsp/RtspSession.h"
 #include "Http/HttpSession.h"
 #include "WebHook.h"
+#include "Record/MP4Recorder.h"
 
 using namespace Json;
 using namespace toolkit;
@@ -71,6 +56,7 @@ const string kOnRecordMp4 = HOOK_FIELD"on_record_mp4";
 const string kOnShellLogin = HOOK_FIELD"on_shell_login";
 const string kOnStreamNoneReader = HOOK_FIELD"on_stream_none_reader";
 const string kOnHttpAccess = HOOK_FIELD"on_http_access";
+const string kOnServerStarted = HOOK_FIELD"on_server_started";
 const string kAdminParams = HOOK_FIELD"admin_params";
 
 onceToken token([](){
@@ -87,6 +73,7 @@ onceToken token([](){
     mINI::Instance()[kOnShellLogin] = "https://127.0.0.1/index/hook/on_shell_login";
     mINI::Instance()[kOnStreamNoneReader] = "https://127.0.0.1/index/hook/on_stream_none_reader";
     mINI::Instance()[kOnHttpAccess] = "https://127.0.0.1/index/hook/on_http_access";
+    mINI::Instance()[kOnServerStarted] = "https://127.0.0.1/index/hook/on_server_started";
     mINI::Instance()[kAdminParams] = "secret=035c73f7-bb6b-4889-a715-d9eb2d1925cc";
 },nullptr);
 }//namespace Hook
@@ -177,6 +164,20 @@ static ArgsType make_json(const MediaInfo &args){
     return std::move(body);
 }
 
+static void reportServerStarted(){
+    GET_CONFIG(bool,hook_enable,Hook::kEnable);
+    GET_CONFIG(string,hook_server_started,Hook::kOnServerStarted);
+    if(!hook_enable || hook_server_started.empty()){
+        return;
+    }
+
+    ArgsType body;
+    for (auto &pr : mINI::Instance()) {
+        body[pr.first] = (string &) pr.second;
+    }
+    //执行hook
+    do_http_hook(hook_server_started,body, nullptr);
+}
 
 void installWebHook(){
     GET_CONFIG(bool,hook_enable,Hook::kEnable);
@@ -194,8 +195,11 @@ void installWebHook(){
     GET_CONFIG(string,hook_http_access,Hook::kOnHttpAccess);
 
     NoticeCenter::Instance().addListener(nullptr,Broadcast::kBroadcastMediaPublish,[](BroadcastMediaPublishArgs){
+        GET_CONFIG(bool,toRtxp,General::kPublishToRtxp);
+        GET_CONFIG(bool,toHls,General::kPublishToHls);
+        GET_CONFIG(bool,toMP4,General::kPublishToMP4);
         if(!hook_enable || args._param_strs == hook_adminparams || hook_publish.empty() || sender.get_peer_ip() == "127.0.0.1"){
-            invoker("");
+            invoker("",toRtxp,toHls,toMP4);
             return;
         }
         //异步执行该hook api，防止阻塞NoticeCenter
@@ -205,7 +209,31 @@ void installWebHook(){
         body["id"] = sender.getIdentifier();
         //执行hook
         do_http_hook(hook_publish,body,[invoker](const Value &obj,const string &err){
-            invoker(err);
+            if(err.empty()){
+                //推流鉴权成功
+                bool enableRtxp = toRtxp;
+                bool enableHls = toHls;
+                bool enableMP4 = toMP4;
+
+                //兼容用户不传递enableRtxp、enableHls、enableMP4参数
+                if(obj.isMember("enableRtxp")){
+                    enableRtxp = obj["enableRtxp"].asBool();
+                }
+
+                if(obj.isMember("enableHls")){
+                    enableHls = obj["enableHls"].asBool();
+                }
+
+                if(obj.isMember("enableMP4")){
+                    enableMP4 = obj["enableMP4"].asBool();
+                }
+
+                invoker(err,enableRtxp,enableHls,enableMP4);
+            }else{
+                //推流鉴权失败
+                invoker(err,false, false, false);
+            }
+
         });
     });
 
@@ -225,16 +253,16 @@ void installWebHook(){
     });
 
     NoticeCenter::Instance().addListener(nullptr,Broadcast::kBroadcastFlowReport,[](BroadcastFlowReportArgs){
-        if(!hook_enable || args._param_strs == hook_adminparams || hook_flowreport.empty() || sender.get_peer_ip() == "127.0.0.1"){
+        if(!hook_enable || args._param_strs == hook_adminparams || hook_flowreport.empty() || peerIP == "127.0.0.1"){
             return;
         }
         auto body = make_json(args);
-        body["ip"] = sender.get_peer_ip();
-        body["port"] = sender.get_peer_port();
-        body["id"] = sender.getIdentifier();
         body["totalBytes"] = (Json::UInt64)totalBytes;
         body["duration"] = (Json::UInt64)totalDuration;
         body["player"] = isPlayer;
+        body["ip"] = peerIP;
+        body["port"] = peerPort;
+        body["id"] = sessionIdentifier;
         //执行hook
         do_http_hook(hook_flowreport,body, nullptr);
     });
@@ -297,10 +325,10 @@ void installWebHook(){
         }
         ArgsType body;
         body["regist"] = bRegist;
-        body["schema"] = schema;
-        body["vhost"] = vhost;
-        body["app"] = app;
-        body["stream"] = stream;
+        body["schema"] = sender.getSchema();
+        body["vhost"] = sender.getVhost();
+        body["app"] = sender.getApp();
+        body["stream"] = sender.getId();
         //执行hook
         do_http_hook(hook_stream_chaned,body, nullptr);
     });
@@ -318,7 +346,7 @@ void installWebHook(){
         do_http_hook(hook_stream_not_found,body, nullptr);
     });
 
-#ifdef ENABLE_MP4RECORD
+#ifdef ENABLE_MP4
     //录制mp4文件成功后广播
     NoticeCenter::Instance().addListener(nullptr,Broadcast::kBroadcastRecordMP4,[](BroadcastRecordMP4Args){
         if(!hook_enable || hook_record_mp4.empty()){
@@ -338,7 +366,7 @@ void installWebHook(){
         //执行hook
         do_http_hook(hook_record_mp4,body, nullptr);
     });
-#endif //ENABLE_MP4RECORD
+#endif //ENABLE_MP4
 
     NoticeCenter::Instance().addListener(nullptr,Broadcast::kBroadcastShellLogin,[](BroadcastShellLoginArgs){
         if(!hook_enable || hook_shell_login.empty() || sender.get_peer_ip() == "127.0.0.1"){
@@ -384,7 +412,7 @@ void installWebHook(){
     /**
      * kBroadcastHttpAccess事件触发机制
      * 1、根据http请求头查找cookie，找到进入步骤3
-     * 2、根据http url参数(如果没有根据ip+端口号)查找cookie，如果还是未找到cookie则进入步骤5
+     * 2、根据http url参数查找cookie，如果还是未找到cookie则进入步骤5
      * 3、cookie标记是否有权限访问文件，如果有权限，直接返回文件
      * 4、cookie中记录的url参数是否跟本次url参数一致，如果一致直接返回客户端错误码
      * 5、触发kBroadcastHttpAccess事件
@@ -397,7 +425,7 @@ void installWebHook(){
     //如果没有url参数，客户端又不支持cookie，那么会根据ip和端口追踪用户
     //追踪用户的目的是为了缓存上次鉴权结果，减少鉴权次数，提高性能
     NoticeCenter::Instance().addListener(nullptr,Broadcast::kBroadcastHttpAccess,[](BroadcastHttpAccessArgs){
-        if(sender.get_peer_ip() == "127.0.0.1" && args._param_strs == hook_adminparams){
+        if(sender.get_peer_ip() == "127.0.0.1" || parser.Params() == hook_adminparams){
             //如果是本机或超级管理员访问，那么不做访问鉴权；权限有效期1个小时
             invoker("","",60 * 60);
             return;
@@ -432,6 +460,9 @@ void installWebHook(){
             invoker(obj["err"].asString(),obj["path"].asString(),obj["second"].asInt());
         });
     });
+
+    //汇报服务器重新启动
+    reportServerStarted();
 }
 
 void unInstallWebHook(){

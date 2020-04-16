@@ -1,54 +1,187 @@
 ﻿/*
- * MIT License
- *
- * Copyright (c) 2016-2019 xiongziliang <771730766@qq.com>
+ * Copyright (c) 2016 The ZLMediaKit project authors. All Rights Reserved.
  *
  * This file is part of ZLMediaKit(https://github.com/xiongziliang/ZLMediaKit).
  *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in all
- * copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * Use of this source code is governed by MIT license that can be found in the
+ * LICENSE file in the root of the source tree. All contributing project authors
+ * may be found in the AUTHORS file in the root of the source tree.
  */
 
-
 #include "MediaSource.h"
-#include "MediaFile/MediaReader.h"
+#include "Record/MP4Reader.h"
 #include "Util/util.h"
 #include "Network/sockutil.h"
 #include "Network/TcpSession.h"
-
 using namespace toolkit;
-
 namespace mediakit {
 
 recursive_mutex MediaSource::g_mtxMediaSrc;
 MediaSource::SchemaVhostAppStreamMap MediaSource::g_mapMediaSrc;
 
+MediaSource::MediaSource(const string &strSchema, const string &strVhost, const string &strApp, const string &strId) :
+        _strSchema(strSchema), _strApp(strApp), _strId(strId) {
+    if (strVhost.empty()) {
+        _strVhost = DEFAULT_VHOST;
+    } else {
+        _strVhost = strVhost;
+    }
+}
 
-void MediaSource::findAsync(const MediaInfo &info,
-                            const std::shared_ptr<TcpSession> &session,
-                            bool retry,
-                            const function<void(const MediaSource::Ptr &src)> &cb){
+MediaSource::~MediaSource() {
+    unregist();
+}
 
-    auto src = MediaSource::find(info._schema,
-                                 info._vhost,
-                                 info._app,
-                                 info._streamid,
-                                 true);
+const string& MediaSource::getSchema() const {
+    return _strSchema;
+}
+
+const string& MediaSource::getVhost() const {
+    return _strVhost;
+}
+
+const string& MediaSource::getApp() const {
+    //获取该源的id
+    return _strApp;
+}
+
+const string& MediaSource::getId() const {
+    return _strId;
+}
+
+vector<Track::Ptr> MediaSource::getTracks(bool trackReady) const {
+    auto strongPtr = _track_source.lock();
+    if(strongPtr){
+        return strongPtr->getTracks(trackReady);
+    }
+    return vector<Track::Ptr>();
+}
+
+void MediaSource::setTrackSource(const std::weak_ptr<TrackSource> &track_src) {
+    _track_source = track_src;
+}
+
+void MediaSource::setListener(const std::weak_ptr<MediaSourceEvent> &listener){
+    _listener = listener;
+}
+
+const std::weak_ptr<MediaSourceEvent>& MediaSource::getListener() const{
+    return _listener;
+}
+
+int MediaSource::totalReaderCount(){
+    auto listener = _listener.lock();
+    if(!listener){
+        return readerCount();
+    }
+    return listener->totalReaderCount(*this);
+}
+bool MediaSource::seekTo(uint32_t ui32Stamp) {
+    auto listener = _listener.lock();
+    if(!listener){
+        return false;
+    }
+    return listener->seekTo(*this,ui32Stamp);
+}
+
+bool MediaSource::close(bool force) {
+    auto listener = _listener.lock();
+    if(!listener){
+        return false;
+    }
+    return listener->close(*this,force);
+}
+
+void MediaSource::onNoneReader(){
+    auto listener = _listener.lock();
+    if(!listener){
+        return;
+    }
+    if (listener->totalReaderCount(*this) == 0) {
+        listener->onNoneReader(*this);
+    }
+}
+
+bool MediaSource::setupRecord(Recorder::type type, bool start, const string &custom_path){
+    auto listener = _listener.lock();
+    if (!listener) {
+        return false;
+    }
+    return listener->setupRecord(*this, type, start, custom_path);
+}
+
+bool MediaSource::isRecording(Recorder::type type){
+    auto listener = _listener.lock();
+    if(!listener){
+        return false;
+    }
+    return listener->isRecording(*this, type);
+}
+
+void MediaSource::for_each_media(const function<void(const MediaSource::Ptr &src)> &cb) {
+    decltype(g_mapMediaSrc) copy;
+    {
+        //拷贝g_mapMediaSrc后再遍历，考虑到是高频使用的全局单例锁，并且在上锁时会执行回调代码
+        //很容易导致多个锁交叉死锁的情况，而且该函数使用频率不高，拷贝开销相对来说是可以接受的
+        lock_guard<recursive_mutex> lock(g_mtxMediaSrc);
+        copy = g_mapMediaSrc;
+    }
+
+    for (auto &pr0 : copy) {
+        for (auto &pr1 : pr0.second) {
+            for (auto &pr2 : pr1.second) {
+                for (auto &pr3 : pr2.second) {
+                    auto src = pr3.second.lock();
+                    if(src){
+                        cb(src);
+                    }
+                }
+            }
+        }
+    }
+}
+
+template<typename MAP, typename FUNC>
+static bool searchMedia(MAP &map, const string &schema, const string &vhost, const string &app, const string &id, FUNC &&func) {
+    auto it0 = map.find(schema);
+    if (it0 == map.end()) {
+        //未找到协议
+        return false;
+    }
+    auto it1 = it0->second.find(vhost);
+    if (it1 == it0->second.end()) {
+        //未找到vhost
+        return false;
+    }
+    auto it2 = it1->second.find(app);
+    if (it2 == it1->second.end()) {
+        //未找到app
+        return false;
+    }
+    auto it3 = it2->second.find(id);
+    if (it3 == it2->second.end()) {
+        //未找到streamId
+        return false;
+    }
+    return func(it0, it1, it2, it3);
+}
+
+template<typename MAP, typename IT0, typename IT1, typename IT2>
+static void eraseIfEmpty(MAP &map, IT0 it0, IT1 it1, IT2 it2) {
+    if (it2->second.empty()) {
+        it1->second.erase(it2);
+        if (it1->second.empty()) {
+            it0->second.erase(it1);
+            if (it0->second.empty()) {
+                map.erase(it0);
+            }
+        }
+    }
+};
+
+void findAsync_l(const MediaInfo &info, const std::shared_ptr<TcpSession> &session, bool retry,
+                 const function<void(const MediaSource::Ptr &src)> &cb){
+    auto src = MediaSource::find(info._schema, info._vhost, info._app, info._streamid, true);
     if(src || !retry){
         cb(src);
         return;
@@ -81,7 +214,11 @@ void MediaSource::findAsync(const MediaInfo &info,
             return;
         }
 
-        if(!bRegist || schema != info._schema || vhost != info._vhost || app != info._app ||stream != info._streamid){
+        if (!bRegist ||
+            sender.getSchema() != info._schema ||
+            sender.getVhost() != info._vhost ||
+            sender.getApp() != info._app ||
+            sender.getId() != info._streamid) {
             //不是自己感兴趣的事件，忽略之
             return;
         }
@@ -99,18 +236,18 @@ void MediaSource::findAsync(const MediaInfo &info,
             }
             DebugL << "收到媒体注册事件,回复播放器:" << info._schema << "/" << info._vhost << "/" << info._app << "/" << info._streamid;
             //再找一遍媒体源，一般能找到
-            findAsync(info,strongSession,false,cb);
+            findAsync_l(info,strongSession,false,cb);
         }, false);
     };
     //监听媒体注册事件
     NoticeCenter::Instance().addListener(listener_tag, Broadcast::kBroadcastMediaChanged, onRegist);
 }
-MediaSource::Ptr MediaSource::find(
-        const string &schema,
-        const string &vhost_tmp,
-        const string &app,
-        const string &id,
-        bool bMake) {
+
+void MediaSource::findAsync(const MediaInfo &info, const std::shared_ptr<TcpSession> &session,const function<void(const Ptr &src)> &cb){
+    return findAsync_l(info, session, true, cb);
+}
+
+MediaSource::Ptr MediaSource::find(const string &schema, const string &vhost_tmp, const string &app, const string &id, bool bMake) {
     string vhost = vhost_tmp;
     if(vhost.empty()){
         vhost = DEFAULT_VHOST;
@@ -121,26 +258,28 @@ MediaSource::Ptr MediaSource::find(
         vhost = DEFAULT_VHOST;
     }
 
-    lock_guard<recursive_mutex> lock(g_mtxMediaSrc);
     MediaSource::Ptr ret;
-	//查找某一媒体源，找到后返回
-    searchMedia(schema, vhost, app, id,
-                [&](SchemaVhostAppStreamMap::iterator &it0 ,
-                    VhostAppStreamMap::iterator &it1,
-                    AppStreamMap::iterator &it2,
-                    StreamMap::iterator &it3){
-                    ret = it3->second.lock();
-                    if(!ret){
-                        //该对象已经销毁
-                        it2->second.erase(it3);
-                        eraseIfEmpty(it0,it1,it2);
-                        return false;
-                    }
-                    return true;
-                });
+    {
+        lock_guard<recursive_mutex> lock(g_mtxMediaSrc);
+        //查找某一媒体源，找到后返回
+        searchMedia(g_mapMediaSrc, schema, vhost, app, id, [&](SchemaVhostAppStreamMap::iterator &it0,
+                                                               VhostAppStreamMap::iterator &it1,
+                                                               AppStreamMap::iterator &it2,
+                                                               StreamMap::iterator &it3) {
+            ret = it3->second.lock();
+            if (!ret) {
+                //该对象已经销毁
+                it2->second.erase(it3);
+                eraseIfEmpty(g_mapMediaSrc, it0, it1, it2);
+                return false;
+            }
+            return true;
+        });
+    }
+
     if(!ret && bMake){
         //未查找媒体源，则创建一个
-        ret = MediaReader::onMakeMediaSource(schema, vhost,app,id);
+        ret = createFromMP4(schema, vhost, app, id);
     }
     return ret;
 }
@@ -155,42 +294,38 @@ void MediaSource::regist() {
         g_mapMediaSrc[_strSchema][_strVhost][_strApp][_strId] =  shared_from_this();
     }
     InfoL << _strSchema << " " << _strVhost << " " << _strApp << " " << _strId;
-    NoticeCenter::Instance().emitEvent(Broadcast::kBroadcastMediaChanged,
-                                       true,
-                                       _strSchema,
-                                       _strVhost,
-                                       _strApp,
-                                       _strId,
-                                       *this);
+    NoticeCenter::Instance().emitEvent(Broadcast::kBroadcastMediaChanged, true, *this);
 }
+
+//反注册该源
 bool MediaSource::unregist() {
-    //反注册该源
-    lock_guard<recursive_mutex> lock(g_mtxMediaSrc);
-    return searchMedia(_strSchema, _strVhost, _strApp, _strId, [&](SchemaVhostAppStreamMap::iterator &it0 ,
-                                                                       VhostAppStreamMap::iterator &it1,
-                                                                       AppStreamMap::iterator &it2,
-                                                                       StreamMap::iterator &it3){
-        auto strongMedia = it3->second.lock();
-        if(strongMedia && this != strongMedia.get()){
-            //不是自己,不允许反注册
-            return false;
-        }
-        it2->second.erase(it3);
-        eraseIfEmpty(it0,it1,it2);
-        unregisted();
-        return true;
-    });
+    bool ret;
+    {
+        lock_guard<recursive_mutex> lock(g_mtxMediaSrc);
+        ret = searchMedia(g_mapMediaSrc, _strSchema, _strVhost, _strApp, _strId,
+                          [&](SchemaVhostAppStreamMap::iterator &it0,
+                              VhostAppStreamMap::iterator &it1,
+                              AppStreamMap::iterator &it2,
+                              StreamMap::iterator &it3) {
+                              auto strongMedia = it3->second.lock();
+                              if (strongMedia && this != strongMedia.get()) {
+                                  //不是自己,不允许反注册
+                                  return false;
+                              }
+                              it2->second.erase(it3);
+                              eraseIfEmpty(g_mapMediaSrc, it0, it1, it2);
+                              return true;
+                          });
+    }
+
+    if(ret){
+        InfoL <<  "" <<  _strSchema << " " << _strVhost << " " << _strApp << " " << _strId;
+        NoticeCenter::Instance().emitEvent(Broadcast::kBroadcastMediaChanged, false, *this);
+    }
+    return ret;
 }
-void MediaSource::unregisted(){
-    InfoL <<  "" <<  _strSchema << " " << _strVhost << " " << _strApp << " " << _strId;
-    NoticeCenter::Instance().emitEvent(Broadcast::kBroadcastMediaChanged,
-                                       false,
-                                       _strSchema,
-                                       _strVhost,
-                                       _strApp,
-                                       _strId,
-                                       *this);
-}
+
+/////////////////////////////////////MediaInfo//////////////////////////////////////
 
 void MediaInfo::parse(const string &url){
     //string url = "rtsp://127.0.0.1:8554/live/id?key=val&a=1&&b=2&vhost=vhost.com";
@@ -210,6 +345,12 @@ void MediaInfo::parse(const string &url){
         } else{
             _host = _vhost = vhost;
         }
+
+        if(_vhost == "localhost" || INADDR_NONE != inet_addr(_vhost.data())){
+            //如果访问的是localhost或ip，那么则为默认虚拟主机
+            _vhost = DEFAULT_VHOST;
+        }
+
     }
     if(split_vec.size() > 1){
         _app = split_vec[1];
@@ -226,9 +367,9 @@ void MediaInfo::parse(const string &url){
         if(pos != string::npos){
             _streamid = steamid.substr(0,pos);
             _param_strs = steamid.substr(pos + 1);
-            _params = Parser::parseArgs(_param_strs);
-            if(_params.find(VHOST_KEY) != _params.end()){
-                _vhost = _params[VHOST_KEY];
+            auto params = Parser::parseArgs(_param_strs);
+            if(params.find(VHOST_KEY) != params.end()){
+                _vhost = params[VHOST_KEY];
             }
         } else{
             _streamid = steamid;
@@ -236,24 +377,123 @@ void MediaInfo::parse(const string &url){
     }
 
     GET_CONFIG(bool,enableVhost,General::kEnableVhost);
-    if(!enableVhost || _vhost.empty() || _vhost == "localhost" || INADDR_NONE != inet_addr(_vhost.data())){
+    if(!enableVhost || _vhost.empty()){
+        //如果关闭虚拟主机或者虚拟主机为空，则设置虚拟主机为默认
         _vhost = DEFAULT_VHOST;
     }
 }
 
-void MediaSourceEvent::onNoneReader(MediaSource &sender){
-    //没有任何读取器消费该源，表明该源可以关闭了
-    WarnL << sender.getSchema() << "/" << sender.getVhost() << "/" << sender.getApp() << "/" << sender.getId();
-    weak_ptr<MediaSource> weakPtr = sender.shared_from_this();
+/////////////////////////////////////MediaSourceEvent//////////////////////////////////////
 
-    //异步广播该事件，防止同步调用sender.close()导致在接收rtp或rtmp包时清空包缓存等操作
-    EventPollerPool::Instance().getPoller()->async([weakPtr](){
-        auto strongPtr = weakPtr.lock();
-        if(strongPtr){
-            NoticeCenter::Instance().emitEvent(Broadcast::kBroadcastStreamNoneReader,*strongPtr);
+void MediaSourceEvent::onNoneReader(MediaSource &sender){
+    GET_CONFIG(string, recordApp, Record::kAppName);
+    GET_CONFIG(int, stream_none_reader_delay, General::kStreamNoneReaderDelayMS);
+
+    //如果mp4点播, 无人观看时我们强制关闭点播
+    bool is_mp4_vod = sender.getApp() == recordApp;
+    //无人观看mp4点播时，3秒后自动关闭
+    auto close_delay = is_mp4_vod ? 3.0 : stream_none_reader_delay / 1000.0;
+
+    //没有任何人观看该视频源，表明该源可以关闭了
+    weak_ptr<MediaSource> weakSender = sender.shared_from_this();
+    _async_close_timer = std::make_shared<Timer>(close_delay, [weakSender,is_mp4_vod]() {
+        auto strongSender = weakSender.lock();
+        if (!strongSender) {
+            //对象已经销毁
+            return false;
         }
-    },false);
+
+        if (strongSender->totalReaderCount() != 0) {
+            //还有人消费
+            return false;
+        }
+
+        if(!is_mp4_vod){
+            //直播时触发无人观看事件，让开发者自行选择是否关闭
+            WarnL << "无人观看事件:"
+                  << strongSender->getSchema() << "/"
+                  << strongSender->getVhost() << "/"
+                  << strongSender->getApp() << "/"
+                  << strongSender->getId();
+            NoticeCenter::Instance().emitEvent(Broadcast::kBroadcastStreamNoneReader, *strongSender);
+        }else{
+            //这个是mp4点播，我们自动关闭
+            WarnL << "MP4点播无人观看,自动关闭:"
+                  << strongSender->getSchema() << "/"
+                  << strongSender->getVhost() << "/"
+                  << strongSender->getApp() << "/"
+                  << strongSender->getId();
+            strongSender->close(false);
+        }
+
+        return false;
+    }, nullptr);
 }
 
+MediaSource::Ptr MediaSource::createFromMP4(const string &schema, const string &vhost, const string &app, const string &stream, const string &filePath , bool checkApp){
+    GET_CONFIG(string, appName, Record::kAppName);
+    if (checkApp && app != appName) {
+        return nullptr;
+    }
+#ifdef ENABLE_MP4
+    try {
+        MP4Reader::Ptr pReader(new MP4Reader(vhost, app, stream, filePath));
+        pReader->startReadMP4();
+        return MediaSource::find(schema, vhost, app, stream, false);
+    } catch (std::exception &ex) {
+        WarnL << ex.what();
+        return nullptr;
+    }
+#else
+    WarnL << "创建MP4点播失败，请编译时打开\"ENABLE_MP4\"选项";
+    return nullptr;
+#endif //ENABLE_MP4
+}
+
+static bool isFlushAble_default(bool is_audio, uint32_t last_stamp, uint32_t new_stamp, int cache_size) {
+    if (new_stamp < last_stamp) {
+        //时间戳回退(可能seek中)
+        return true;
+    }
+
+    if (!is_audio) {
+        //这是视频,时间戳发送变化或者缓存超过1024个
+        return last_stamp != new_stamp || cache_size >= 1024;
+    }
+
+    //这是音频,缓存超过100ms或者缓存个数超过10个
+    return new_stamp > last_stamp + 100 || cache_size > 10;
+}
+
+static bool isFlushAble_merge(bool is_audio, uint32_t last_stamp, uint32_t new_stamp, int cache_size, int merge_ms) {
+    if (new_stamp < last_stamp) {
+        //时间戳回退(可能seek中)
+        return true;
+    }
+
+    if(new_stamp > last_stamp + merge_ms){
+        //时间戳增量超过合并写阈值
+        return true;
+    }
+
+    if (!is_audio) {
+        //这是视频,缓存数超过1024个,这个逻辑用于避免时间戳异常的流导致的内存暴增问题
+        //而且sendmsg接口一般最多只能发送1024个数据包
+        return cache_size >= 1024;
+    }
+
+    //这是音频，音频缓存超过20个
+    return cache_size > 20;
+}
+
+bool FlushPolicy::isFlushAble(uint32_t last_stamp, uint32_t new_stamp, int cache_size) {
+    GET_CONFIG(bool,ultraLowDelay, General::kUltraLowDelay);
+    GET_CONFIG(int,mergeWriteMS, General::kMergeWriteMS);
+    if(ultraLowDelay || mergeWriteMS <= 0){
+        //关闭了合并写或者合并写阈值小于等于0
+        return isFlushAble_default(_is_audio, last_stamp, new_stamp, cache_size);
+    }
+    return isFlushAble_merge(_is_audio, last_stamp, new_stamp, cache_size,mergeWriteMS);
+}
 
 } /* namespace mediakit */
